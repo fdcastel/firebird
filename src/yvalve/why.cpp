@@ -144,7 +144,7 @@ private:
 public:
 	typedef UCharBuffer DataBuffer;
 
-	SQLDAMetadata(const XSQLDA* aSqlda);
+	SQLDAMetadata(const XSQLDA* aSqlda, MemoryPool& aPool);
 	~SQLDAMetadata() { delete[] offsets; }
 
 	unsigned getCount(CheckStatusWrapper* status) override;
@@ -173,6 +173,7 @@ public:
 private:
 	void assign(); // copy metadata from sqlda and calculate length and offsets
 
+	MemoryPool& pool;	// offsets[] come from here
 	const XSQLDA* sqlda;
 	unsigned count;
 
@@ -202,11 +203,12 @@ class SQLDAMetadataLauncher
 public:
 	SQLDAMetadata* metadata;
 
-	explicit SQLDAMetadataLauncher(const XSQLDA* sqlda) : metadata(NULL)
+	explicit SQLDAMetadataLauncher(const XSQLDA* sqlda, MemoryPool& pool = *getDefaultMemoryPool())
+		: metadata(NULL), buffer(pool)
 	{
 		if (sqlda)
 		{
-			metadata = FB_NEW SQLDAMetadata(sqlda);
+			metadata = FB_NEW_POOL(pool) SQLDAMetadata(sqlda, pool);
 			metadata->addRef();
 		}
 	}
@@ -240,8 +242,8 @@ private:
 	SQLDAMetadata::DataBuffer buffer;
 };
 
-SQLDAMetadata::SQLDAMetadata(const XSQLDA* aSqlda)
-	: sqlda(aSqlda), count(0), offsets(NULL), length(0), alignment(0), speedHackEnabled(false)
+SQLDAMetadata::SQLDAMetadata(const XSQLDA* aSqlda, MemoryPool& aPool)
+	: pool(aPool), sqlda(aSqlda), count(0), offsets(NULL), length(0), alignment(0), speedHackEnabled(false)
 {
 	if (sqlda && sqlda->version != SQLDA_VERSION1)
 	{
@@ -454,7 +456,7 @@ void SQLDAMetadata::assign()
 	speedHackEnabled = true; // May be we are lucky...
 	const ISC_SCHAR* const base = sqlda->sqlvar[0].sqldata;
 
-	offsets = FB_NEW OffsetItem[count];
+	offsets = FB_NEW_POOL(pool) OffsetItem[count];
 	for (unsigned i = 0; i < count; i++)
 	{
 		const XSQLVAR& var = sqlda->sqlvar[i];
@@ -1232,8 +1234,9 @@ namespace Why
 	public:
 		static constexpr ISC_STATUS ERROR_CODE = isc_bad_stmt_handle;
 
-		explicit IscStatement(YAttachment* aAttachment) noexcept
-			: attachment(aAttachment),
+		explicit IscStatement(YAttachment* aAttachment)
+			: fetchPool(MemoryPool::createPool()),
+			  attachment(aAttachment),
 			  cursorName(getPool()),
 			  statement(NULL),
 			  userHandle(NULL),
@@ -1285,6 +1288,9 @@ namespace Why
 			return statement;
 		}
 
+		// Per-statement pool for the transient SQLDAMetadata of isc_dsql_fetch, so
+		// fetches on different statements don't contend on the default pool's mutex.
+		MemoryPool* const fetchPool;
 		AtomicAttPtr attachment;
 		string cursorName;
 		YStatement* statement;
@@ -2555,7 +2561,11 @@ ISC_STATUS API_ROUTINE isc_dsql_fetch(ISC_STATUS* userStatus, isc_stmt_handle* s
 
 		RefPtr<IscStatement> statement(translateHandle(statements, stmtHandle));
 
-		SQLDAMetadataLauncher outMessage(sqlda);
+		// The metadata of the first fetch after a delayed-format open is kept by the
+		// remote layer after the call, so it must not come from the statement's pool
+		// (which dies with the statement). Later ones are freed when the call returns.
+		SQLDAMetadataLauncher outMessage(sqlda,
+			statement->delayedFormat ? *getDefaultMemoryPool() : *statement->fetchPool);
 
 		if (statement->fetch(&statusWrapper, outMessage.metadata, outMessage.getBuffer()))
 			outMessage.scatterData();
@@ -4630,6 +4640,8 @@ IscStatement::~IscStatement()
 	}
 
 	removeHandle(&statements, handle);
+
+	MemoryPool::deletePool(fetchPool);
 }
 
 void IscStatement::destroy(unsigned)
