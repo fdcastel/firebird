@@ -1235,7 +1235,7 @@ namespace Why
 		static constexpr ISC_STATUS ERROR_CODE = isc_bad_stmt_handle;
 
 		explicit IscStatement(YAttachment* aAttachment)
-			: fetchPool(MemoryPool::createPool()),
+			: fetchPool(MemoryPool::createPool(nullptr, fetchStats)),
 			  attachment(aAttachment),
 			  cursorName(getPool()),
 			  statement(NULL),
@@ -1290,6 +1290,9 @@ namespace Why
 
 		// Per-statement pool for the transient SQLDAMetadata of isc_dsql_fetch, so
 		// fetches on different statements don't contend on the default pool's mutex.
+		// Statistics group of its own (no parent), so its allocations don't update the
+		// process-wide counters of the default statistics group.
+		MemoryStats fetchStats;
 		MemoryPool* const fetchPool;
 		AtomicAttPtr attachment;
 		string cursorName;
